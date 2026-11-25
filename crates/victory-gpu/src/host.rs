@@ -3545,6 +3545,115 @@ fn pump() {
 mod batch {   // `mod tests` is already taken at the top of this file
     use super::*;
 
+    /// Runs real buffer refreshes and reads back every requested page.
+    /// Run this ignored benchmark alone so the global byte counter is ours.
+    #[test]
+    #[ignore = "reports single-threaded hardware timings"]
+    fn benchmark_scattered_refresh_readback() {
+        use crate::watch::{PAGE, tests::{free, pool}};
+        const PAGES: usize = 256;
+        const REQUESTS: usize = 33;
+        let host = host().expect("a hardware D3D12 device");
+        let p = pool(PAGES);
+        let bytes = PAGES * PAGE;
+        crate::shadow::register(p, p as u64, bytes as u64);
+        let source = crate::shadow::find(p as u64, bytes as u64).unwrap();
+        let (out, out_data) = host.shared_buffer((REQUESTS * 4) as u64).unwrap();
+        let layouts = [
+            ("dense", std::array::from_fn::<_, REQUESTS, _>(|i| i)),
+            ("sparse", std::array::from_fn(|i| (i * 8).min(PAGES - 1))),
+        ];
+        let lists = layouts.map(|(_, pages)| {
+            let list = host.new_list().unwrap();
+            for (i, page) in pages.into_iter().enumerate() {
+                let address = (p + page * PAGE) as u64;
+                source.refresh(&list, address, PAGE as u64);
+                // SAFETY: the list is open; both resources live until all
+                // runs end. The range lies inside the source.
+                unsafe {
+                    list.list.CopyBufferRegion(
+                        &out, (i * 4) as u64, &source.buffer, source.offset(address), 4,
+                    );
+                }
+            }
+            list.close();
+            list
+        });
+        let mut samples = [Vec::new(), Vec::new()];
+        let mut refreshed = [0; 2];
+        for i in 0..13u32 {
+            for index in [i as usize % 2, 1 - i as usize % 2] {
+                let base = 1 + 1024 * (i * 2 + index as u32);
+                {
+                    let _writing = crate::watch::writing(p, bytes);
+                    for page in 0..PAGES {
+                        // SAFETY: inside our live, write-watched allocation.
+                        unsafe { ((p + page * PAGE) as *mut u32).write_volatile(base + page as u32) };
+                    }
+                }
+                let before = PREPARING[1].load(Ordering::Relaxed);
+                let started = Instant::now();
+                host.execute(&[&lists[index]]);
+                let elapsed = started.elapsed().as_micros();
+                let copied = PREPARING[1].load(Ordering::Relaxed) - before;
+                if i >= 4 {
+                    samples[index].push(elapsed);
+                }
+                if i == 0 {
+                    refreshed[index] = copied;
+                }
+                assert_eq!(copied, refreshed[index]);
+                // SAFETY: the GPU is done and the mapped buffer covers the
+                // dword at every index.
+                let actual = unsafe { std::slice::from_raw_parts(out_data.cast::<u32>(), REQUESTS) };
+                assert!(actual.iter().zip(layouts[index].1).all(|(&v, page)| v == base + page as u32));
+            }
+        }
+        for (i, (name, _)) in layouts.iter().enumerate() {
+            samples[i].sort_unstable();
+            eprintln!("REFRESH {name} copied_bytes={} median_submit_us={}", refreshed[i], samples[i][4]);
+        }
+        crate::shadow::unregister(p, p as u64);
+        drop(lists);
+        drop(source);
+        free(p);
+    }
+
+    /// A whole-page refresh after two partial ones lets a GPU write go back.
+    #[test]
+    fn a_gpu_write_goes_back_after_two_partial_refreshes() {
+        use crate::watch::{PAGE, tests::{free, pool}};
+        let Some(host) = host() else {
+            return;
+        };
+        let p = pool(1);
+        crate::shadow::register(p, p as u64, PAGE as u64);
+        let copy = crate::shadow::find(p as u64, PAGE as u64).unwrap();
+        let list = host.new_list().unwrap();
+        let mut batch = Batch::default();
+        for (address, len) in [(p, PAGE / 2), (p + PAGE / 2, PAGE / 2), (p, PAGE)] {
+            batch.add(&copy, address, len);
+            batch.flush();
+        }
+        let (gpu_input, data) = host.upload_buffer(4).unwrap();
+        let expected = 0xfeed_1234u32;
+        // SAFETY: a mapped four-byte source, an open list and a live copy.
+        unsafe {
+            data.cast::<u32>().write(expected);
+            list.list.CopyBufferRegion(&copy.buffer, copy.offset(p as u64), &gpu_input, 0, 4);
+        }
+        list.close();
+        host.execute(&[&list]);
+        copy.copy_back_page(p);
+        // SAFETY: the allocation is live and GPU work has finished.
+        let actual = unsafe { (p as *const u32).read_volatile() };
+        crate::shadow::unregister(p, p as u64);
+        drop(batch);
+        drop(copy);
+        free(p);
+        assert_eq!(actual, expected);
+    }
+
     /// Ranges of one copy stay disjoint: what a range overlaps, or lies
     /// within a page of, coalesces; distant ranges do not copy the span
     /// between them.
