@@ -494,21 +494,9 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> (HashMap<Value, Shape>, 
         let mut writes = exec;
         let fetched: Option<Vec<Sym>> = match (v.dpp, &src0) {
             (Some(d), Some(s)) => {
-                // A narrowed EXEC is refused by name, not simulated: the
-                // lanes the set names are defined (every lane ran at the
-                // section's entry, and only a constant lane set narrows it
-                // since), but what the translated shader reads of them is
-                // not proven — a narrowed-EXEC DPP witness dispatched the
-                // wrong lanes (hardware report in the pull request). The
-                // section keeps refusing it until the emitted fixed-lane
-                // reads are proven.
-                if exec != all {
-                    vec.insert(dst, vec![Sym::Unknown; wave as usize]);
-                    unknown.get_or_insert(
-                        "a whole-wave section step the simulation does not follow: a DPP step over lanes it has not named",
-                    );
-                    continue;
-                }
+                // Every lane ran at the section's entry. A known EXEC and
+                // the DPP flags select the sources and the lanes that write.
+                // Keep the source lane in the symbolic value through the fetch.
                 let mut f = Vec::with_capacity(wave as usize);
                 let mut ok = true;
                 for l in 0..wave {
@@ -1094,12 +1082,9 @@ mod tests {
         assert_eq!(sec.shapes.get(&v3_val), Some(&Shape::K(7)));
     }
 
-    /// A DPP step over a lane set the section named by a constant (prefix
-    /// scans narrow EXEC that way) stays refused by name: the lanes are
-    /// defined, but the translated fixed-lane reads of them are not
-    /// proven, and a witness dispatched the wrong lanes.
+    /// An identity DPP move under a constant EXEC preserves inactive lanes.
     #[test]
-    fn dpp_over_a_lane_set_the_section_names_stays_refused() {
+    fn dpp_over_a_lane_set_the_section_names_preserves_inactive_lanes() {
         // s_or_saveexec s0, -1; v_mov_b32 v1, 7; s_mov_b32 exec, -2;
         // v_mov_b32 v2, v1 dpp16 quad-perm sel 0xE4 (identity);
         // s_mov_b32 exec, s0.
@@ -1125,14 +1110,9 @@ mod tests {
             let (unknown, shape) = section(false);
             assert_eq!(unknown, None);
             assert_eq!(shape, Some(Shape::K(7)));
-            // Lane 0 left out: refused by the section's named kind.
-            let (unknown, _shape) = section(true);
-            assert_eq!(
-                unknown,
-                Some(
-                    "a whole-wave section step the simulation does not follow: a DPP step over lanes it has not named"
-                )
-            );
+            let (unknown, shape) = section(true);
+            assert_eq!(unknown, None);
+            assert_eq!(shape, None, "lane 0 kept its old destination");
         }
     }
 

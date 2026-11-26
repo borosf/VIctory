@@ -240,21 +240,56 @@ fn build_wave(
 /// the inactive destination and the nonidentity permutation reach the UAV.
 #[test]
 fn narrowed_exec_dpp_reads_a_lane_and_preserves_inactive_destinations() {
-    check_narrowed_exec_dpp(false);
+    check_narrowed_exec_dpp(false, 194, [0x7e04_02fa, 0xff00_d801], |base, special| {
+        [37, base, special, base]
+    });
 }
 
 /// With invocation IDs as the source, each fixed-lane read must still
 /// broadcast one value to every writer after EXEC is restored.
 #[test]
 fn narrowed_exec_dpp_reads_the_selected_lanes_invocation_id() {
-    check_narrowed_exec_dpp(true);
+    check_narrowed_exec_dpp(true, 194, [0x7e04_02fa, 0xff00_d801], |_, special| {
+        [37, 2, special, 3]
+    });
 }
 
-fn check_narrowed_exec_dpp(lane_varying: bool) {
+/// All active destinations select lane 2, whose EXEC bit is clear. DPP16
+/// without FI preserves or zeroes the destination according to BOUND_CTRL.
+/// DPP8 without FI zeroes it. Both forms with FI read lane 2's input VGPR.
+#[test]
+fn narrowed_exec_dpp_inactive_sources_follow_fi_and_bound_ctrl() {
+    let dpp16 = |fi, bound| {
+        [
+            0x7e04_02fa,
+            0xff00_aa01 | (u32::from(fi) << 18) | (u32::from(bound) << 19),
+        ]
+    };
+    let dpp8 = |fi| [if fi { 0x7e04_02ea } else { 0x7e04_02e9 }, 0x4924_9201];
+    for (op, value) in [
+        (dpp16(false, false), 37),
+        (dpp16(false, true), 0),
+        (dpp16(true, false), 2),
+        (dpp16(true, true), 2),
+        (dpp8(false), 0),
+        (dpp8(true), 2),
+    ] {
+        // EXEC = -5 leaves lane 2's destination at its initial 37.
+        check_narrowed_exec_dpp(true, 197, op, |_, _| [value, value, 37, value]);
+    }
+}
+
+fn check_narrowed_exec_dpp(
+    lane_varying: bool,
+    exec: u32,
+    dpp: [u32; 2],
+    expected: impl Fn(u32, u32) -> [u32; 4],
+) {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let mut bad = 0;
+    let mut device_available = false;
     for (wave64, save, mov, threads) in [(false, 0x3d, 3, 32), (true, 0x25, 4, 64)] {
         let sop = |dst: u32, op: u32, src: u32| 0xbe80_0000 | dst << 16 | op << 8 | src;
         let mut words = vec![
@@ -271,10 +306,9 @@ fn check_narrowed_exec_dpp(lane_varying: bool) {
             0x7e04_02a5,       // v_mov_b32 v2, 37
             sop(126, mov, 130), // EXEC = 2: only lane 1
             0x7e02_0201,       // v_mov_b32 v1, s1
-            sop(126, mov, 194), // EXEC = -2: all except lane 0
-            0x7e04_02fa,
-            0xff00_d801, // v_mov_b32 v2, v1 quad_perm:[0,2,1,3]
+            sop(126, mov, exec),
         ];
+        words.extend(dpp); // v_mov_b32_dpp v2, v1
         for lane in 0..4 {
             // v_readlane_b32 s[20 + lane], v2, lane
             words.extend([0xd760_0014 + lane, 258 | (128 + lane) << 9]);
@@ -298,6 +332,7 @@ fn check_narrowed_exec_dpp(lane_varying: bool) {
         );
         for (label, warp) in [("hardware", false), ("warp", true)] {
             let Ok(host) = Host::new(warp) else { continue };
+            device_available = true;
             use windows::Win32::Graphics::Direct3D12::{
                 D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
             };
@@ -343,23 +378,20 @@ fn check_narrowed_exec_dpp(lane_varying: bool) {
                         },
                     )
                     .expect("readback");
-                let expected = if lane_varying {
-                    [37, 2, special, 3]
-                } else {
-                    [37, base, special, base]
-                };
+                let expected = expected(base, special);
                 assert_eq!(out[0].len(), 4 * threads as usize);
                 let (records, _) = out[0].as_chunks::<4>();
                 let mismatches = records.iter().filter(|&&record| record != expected).count();
                 bad += mismatches;
                 eprintln!(
-                    "{label}: wave{threads}, {mismatches}/{threads} mismatched records; expected {expected:?}; first two {:?}",
+                    "{label}: wave{threads}, DPP {dpp:08x?}, {mismatches}/{threads} mismatched records; expected {expected:?}; first two {:?}",
                     &out[0][..8]
                 );
             }
         }
     }
-    assert_eq!(bad, 0, "fixed-lane scalar reads after DPP");
+    assert!(device_available, "no SM 6.6 hardware or WARP device available");
+    assert_eq!(bad, 0, "fixed-lane scalar reads after DPP {dpp:08x?}");
 }
 
 #[test]
